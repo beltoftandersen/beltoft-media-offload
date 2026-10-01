@@ -29,7 +29,7 @@ function beltoft_media_offload_uninstall_site() {
 			'bmo_server_rule',
 		)
 	);
-	array_map( 'wp_clear_scheduled_hook', array( 'bmo_retry_orphans', 'bmo_deferred_delete_sweep', 'bmo_server_check', 'bmo_license_check' ) );
+	array_map( 'wp_clear_scheduled_hook', array( 'bmo_retry_orphans', 'bmo_deferred_delete_sweep', 'bmo_server_check', 'bmo_server_recheck', 'bmo_license_check' ) );
 	array_map( 'delete_post_meta_by_key', array( '_bmo_local_delete_pending', '_bmo_skip' ) );
 
 	// Per-attachment lock rows left behind.

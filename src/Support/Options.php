@@ -100,7 +100,23 @@ class Options {
 	 * every hard-coded link to a deleted file would break.
 	 */
 	public static function delete_local_enabled() {
-		return '1' === (string) self::get( 'delete_local' ) && \BeltoftMediaOffload\Media\ServerRule::is_verified();
+		return self::delete_local_wanted() && \BeltoftMediaOffload\Media\ServerRule::is_verified();
+	}
+
+	/**
+	 * Whether "Delete local files" is switched on, verified or not: files
+	 * are then flagged for deletion while it's paused.
+	 */
+	public static function delete_local_wanted() {
+		return '1' === (string) self::get( 'delete_local' );
+	}
+
+	/**
+	 * Capability for the settings: on multisite only network admins, since
+	 * the settings make the server send requests to any host.
+	 */
+	public static function capability() {
+		return is_multisite() ? 'manage_network_options' : 'manage_options';
 	}
 
 	/**
@@ -257,14 +273,14 @@ class Options {
 		// every file whose local copy is gone.
 		$current = self::all();
 		$locked  = false;
-		foreach ( array( 'endpoint', 'bucket', 'path_style', 'use_ssl' ) as $field ) {
+		foreach ( array( 'endpoint', 'bucket', 'region', 'path_style', 'use_ssl' ) as $field ) {
 			if ( (string) $out[ $field ] !== (string) $current[ $field ] && \BeltoftMediaOffload\Media\Offloader::has_offloaded() ) {
 				$out[ $field ] = $current[ $field ];
 				$locked        = true;
 			}
 		}
 		if ( $locked && function_exists( 'add_settings_error' ) ) {
-			add_settings_error( self::OPTION, 'bmo_location_locked', __( 'Endpoint, bucket, path-style and SSL were not changed: media is offloaded to the current bucket. Take it out first (wp media-offload unoffload), or move the objects and change the settings in the database.', 'beltoft-media-offload' ) );
+			add_settings_error( self::OPTION, 'bmo_location_locked', __( 'Endpoint, bucket, region, path-style and SSL were not changed: media is offloaded to the current bucket. To move to another bucket, run `wp media-offload unoffload --all --allow-reoffload`, change the settings, then `wp media-offload run`.', 'beltoft-media-offload' ) );
 		}
 
 		$excluded              = isset( $input['excluded_paths'] ) ? self::parse_excluded_paths( sanitize_textarea_field( (string) $input['excluded_paths'] ) ) : array();

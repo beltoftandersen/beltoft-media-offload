@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Beltoft Media Offload
  * Description:       Offloads media library uploads to any S3-compatible object storage bucket. A web server rule serves files missing locally from the bucket, so local copies can be deleted safely.
- * Version:           2.0.0
+ * Version:           2.0.1
  * Requires at least: 6.2
  * Requires PHP:      8.2
  * Author:            Internal
@@ -33,7 +33,7 @@ spl_autoload_register(
 	}
 );
 
-define( 'BMO_VERSION', '2.0.0' );
+define( 'BMO_VERSION', '2.0.1' );
 
 // Tells plugins that generate files for an attachment in the background
 // (beltoft-webp) that "delete local files" waits while they report the

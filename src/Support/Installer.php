@@ -51,5 +51,6 @@ class Installer {
 		wp_clear_scheduled_hook( Offloader::RETRY_HOOK );
 		wp_clear_scheduled_hook( Offloader::SWEEP_HOOK );
 		wp_clear_scheduled_hook( ServerRule::CHECK_HOOK );
+		wp_clear_scheduled_hook( ServerRule::RECHECK_HOOK );
 	}
 }

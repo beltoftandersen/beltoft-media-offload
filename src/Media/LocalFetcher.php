@@ -81,7 +81,7 @@ class LocalFetcher {
 
 		$client    = Offloader::client_for( $data );
 		$started   = microtime( true );
-		$synced_at = (int) $data['synced_at'];
+		$mtimes    = isset( $data['mtimes'] ) ? (array) $data['mtimes'] : array();
 		$error     = null;
 
 		foreach ( $missing as $object_key => $path ) {
@@ -94,16 +94,17 @@ class LocalFetcher {
 				$error = $result;
 				break;
 			}
-			// Same content as the bucket copy: give it a modification time no
-			// later than the last sync, or resync would upload it straight
-			// back (it re-uploads files modified since synced_at).
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch -- resetting the modification time of a media file this plugin just downloaded; WP_Filesystem may not be direct in this context.
-			touch( $path, $synced_at - 1 );
+			// Same content as the bucket copy: give it the modification time it
+			// was uploaded with, or resync would upload it straight back.
+			if ( isset( $mtimes[ $object_key ] ) ) {
+				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch -- resetting the modification time of a media file this plugin just downloaded; WP_Filesystem may not be direct in this context.
+				touch( $path, (int) $mtimes[ $object_key ] );
+			}
 		}
 
 		// Whatever did arrive is local now: let the sweep remove it again
 		// later (after resyncing new sizes), unless it's a restore.
-		if ( ! $keep && Options::delete_local_enabled() ) {
+		if ( ! $keep && Options::delete_local_wanted() ) {
 			Offloader::defer_local_delete( $attachment_id, true );
 		}
 
@@ -204,7 +205,7 @@ class LocalFetcher {
 		if ( ! $active && wp_doing_ajax() ) {
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- only reading which core AJAX action is running; that handler verifies its own nonce.
 			$action = isset( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( $_REQUEST['action'] ) ) : '';
-			$active = in_array( $action, array( 'image-editor', 'imgedit-preview', 'crop-image' ), true );
+			$active = in_array( $action, array( 'image-editor', 'imgedit-preview', 'crop-image', 'custom-header-crop' ), true );
 		}
 
 		if ( ! $active && defined( 'REST_REQUEST' ) && REST_REQUEST ) {

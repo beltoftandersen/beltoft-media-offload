@@ -22,6 +22,7 @@ class Client {
 	private $region;
 	private $path_style;
 	private $use_ssl;
+	private $timeout;
 
 	/** @var AwsS3Client|null */
 	private $sdk;
@@ -34,6 +35,7 @@ class Client {
 		$this->region     = ! empty( $config['region'] ) ? (string) $config['region'] : 'us-east-1';
 		$this->path_style = ! empty( $config['path_style'] );
 		$this->use_ssl    = ! empty( $config['use_ssl'] );
+		$this->timeout    = ! empty( $config['timeout'] ) ? (float) $config['timeout'] : 15.0;
 	}
 
 	/**
@@ -53,6 +55,7 @@ class Client {
 			'region'     => Options::get( 'region' ),
 			'path_style' => '1' === (string) Options::get( 'path_style' ),
 			'use_ssl'    => '1' === (string) Options::get( 'use_ssl' ),
+			'timeout'    => 15,
 		);
 
 		foreach ( $overrides as $key => $value ) {
@@ -228,7 +231,7 @@ class Client {
 				null,
 				// Idle timeout, not a total one: long uploads keep going
 				// while data moves, an unreachable bucket fails fast.
-				\Symfony\Component\HttpClient\HttpClient::create( array( 'timeout' => 15 ) )
+				\Symfony\Component\HttpClient\HttpClient::create( array( 'timeout' => $this->timeout ) )
 			);
 		}
 		return $this->sdk;

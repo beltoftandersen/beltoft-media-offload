@@ -57,9 +57,7 @@ class OffloadCommand {
 			\WP_CLI::success( 'Server rule works: files missing locally are served from ' . $state['base'] );
 			return;
 		}
-		if ( ! ServerRule::is_apache() ) {
-			\WP_CLI::log( "Add this to the site's nginx server block, reload nginx, then run this command again:\n\n" . ServerRule::nginx_snippet() . "\n" );
-		}
+		\WP_CLI::log( "On Apache the rule is written to the uploads .htaccess once \"Delete local files\" is on. On nginx, add this to the site's server block, reload nginx, then run this command again:\n\n" . ServerRule::nginx_snippet() . "\n" );
 		\WP_CLI::error( $state['message'] );
 	}
 
@@ -194,7 +192,7 @@ class OffloadCommand {
 		if ( empty( $args ) ) {
 			\WP_CLI::error( 'Give attachment IDs or --all.' );
 		}
-		if ( Options::delete_local_enabled() ) {
+		if ( Options::delete_local_wanted() ) {
 			\WP_CLI::warning( '"Delete local files" is on: new uploads are still deleted locally. Turn it off to keep everything local.' );
 		}
 
@@ -235,15 +233,28 @@ class OffloadCommand {
 	 * [--excluded]
 	 * : Every offloaded attachment under an excluded path.
 	 *
+	 * [--all]
+	 * : Every offloaded attachment.
+	 *
+	 * [--allow-reoffload]
+	 * : Don't mark the attachments as local-only: they're offloaded again
+	 * by the next upload hook, bulk run or `wp media-offload run`. For
+	 * moving to another bucket: unoffload --all --allow-reoffload, change
+	 * the settings, then run.
+	 *
 	 * ## EXAMPLES
 	 *
 	 *     wp media-offload unoffload --excluded
 	 *     wp media-offload unoffload 123
+	 *     wp media-offload unoffload --all --allow-reoffload
 	 */
 	public function unoffload( $args, $assoc_args ) {
 		if ( ! empty( $assoc_args['excluded'] ) ) {
 			$args = Offloader::offloaded_excluded_ids();
+		} elseif ( ! empty( $assoc_args['all'] ) ) {
+			$args = Offloader::offloaded_ids();
 		}
+		$reoffload = ! empty( $assoc_args['allow-reoffload'] );
 		$ids = array_values( array_filter( array_map( 'absint', (array) $args ), array( Offloader::class, 'is_offloaded' ) ) );
 		if ( empty( $ids ) ) {
 			\WP_CLI::success( 'Nothing to do.' );
@@ -258,7 +269,7 @@ class OffloadCommand {
 			// can touch this attachment's files or record in between.
 			$result = AttachmentLock::run(
 				$id,
-				function () use ( $id ) {
+				function () use ( $id, $reoffload ) {
 					if ( ! Offloader::is_offloaded( $id ) ) {
 						return 0;
 					}
@@ -273,7 +284,7 @@ class OffloadCommand {
 						// one. Still offloaded: let the sweep clean up whatever
 						// did get downloaded.
 						delete_post_meta( $id, Offloader::KEEP_LOCAL_META );
-						if ( Options::delete_local_enabled() ) {
+						if ( Options::delete_local_wanted() ) {
 							Offloader::defer_local_delete( $id, true );
 						}
 						return $fetched;
@@ -283,7 +294,11 @@ class OffloadCommand {
 						return new \WP_Error( 'bmo_busy', 'lost the attachment lock; bucket copies kept' );
 					}
 					delete_post_meta( $id, Offloader::DEFERRED_META );
-					return Offloader::delete_offloaded( $id );
+					$failed = Offloader::delete_offloaded( $id );
+					if ( $reoffload ) {
+						delete_post_meta( $id, Offloader::KEEP_LOCAL_META );
+					}
+					return $failed;
 				},
 				60
 			);
@@ -305,6 +320,6 @@ class OffloadCommand {
 		if ( $queued > 0 ) {
 			\WP_CLI::warning( sprintf( '%d bucket object(s) could not be deleted right now and are queued; deletion is retried hourly, or run `wp media-offload retry-deletes`.', $queued ) );
 		}
-		\WP_CLI::success( sprintf( '%d attachment(s) are local-only now and will not be offloaded again.', $ok ) );
+		\WP_CLI::success( $reoffload ? sprintf( '%d attachment(s) are local again and can be offloaded again.', $ok ) : sprintf( '%d attachment(s) are local-only now and will not be offloaded again.', $ok ) );
 	}
 }

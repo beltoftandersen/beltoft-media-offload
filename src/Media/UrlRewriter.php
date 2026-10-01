@@ -121,7 +121,10 @@ class UrlRewriter {
 	 */
 	public static function public_url_for_object( $object_key, array $data ) {
 		$bucket      = (string) $data['bucket'];
-		$key_encoded = implode( '/', array_map( 'rawurlencode', explode( '/', (string) $object_key ) ) );
+		// Like core's own upload URLs: non-ASCII stays as is (core matches
+		// srcset sources by file name); only characters that would end or
+		// change a URL are escaped.
+		$key_encoded = str_replace( array( '%', ' ', '#', '?', '"', '<', '>' ), array( '%25', '%20', '%23', '%3F', '%22', '%3C', '%3E' ), (string) $object_key );
 
 		$domain = Options::public_domain();
 		if ( '' !== $domain ) {

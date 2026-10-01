@@ -54,13 +54,20 @@ class SettingsPage {
 		add_options_page(
 			__( 'Media Offload', 'beltoft-media-offload' ),
 			__( 'Media Offload', 'beltoft-media-offload' ),
-			'manage_options',
+			Options::capability(),
 			'beltoft-media-offload',
 			array( __CLASS__, 'render_page' )
 		);
 	}
 
 	public static function register() {
+		// options.php checks this when the form is saved.
+		add_filter(
+			'option_page_capability_' . Options::SETTING_GROUP,
+			function () {
+				return Options::capability();
+			}
+		);
 		register_setting(
 			Options::SETTING_GROUP,
 			Options::OPTION,
@@ -82,7 +89,7 @@ class SettingsPage {
 	}
 
 	public static function render_page() {
-		if ( ! current_user_can( 'manage_options' ) ) {
+		if ( ! current_user_can( Options::capability() ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'beltoft-media-offload' ) );
 		}
 
@@ -263,7 +270,7 @@ class SettingsPage {
 	}
 
 	public static function handle_check_server() {
-		if ( ! current_user_can( 'manage_options' ) ) {
+		if ( ! current_user_can( Options::capability() ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'beltoft-media-offload' ) );
 		}
 		check_admin_referer( 'bmo_check_server' );
@@ -273,7 +280,7 @@ class SettingsPage {
 	}
 
 	public static function handle_test_connection() {
-		if ( ! current_user_can( 'manage_options' ) ) {
+		if ( ! current_user_can( Options::capability() ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'beltoft-media-offload' ) );
 		}
 		check_admin_referer( 'bmo_test_connection' );

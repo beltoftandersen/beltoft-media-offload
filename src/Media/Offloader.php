@@ -130,24 +130,21 @@ class Offloader {
 			return new \WP_Error( 'bmo_missing_file', 'Local file not found for attachment ' . $attachment_id . '.' );
 		}
 
-		$sync_started = time();
-		$location     = self::current_location();
-		$files        = self::collect_files( $attachment_id, $file, $location['prefix'], $metadata );
-		$client       = S3Client::from_options();
-		foreach ( $files as $object_key => $path ) {
-			$put = self::upload_one( $client, $object_key, $path );
-			if ( is_wp_error( $put ) ) {
-				// Objects already uploaded stay; the next attempt overwrites
-				// them under the same keys.
-				return $put;
-			}
+		$location = self::current_location();
+		$files    = self::collect_files( $attachment_id, $file, $location['prefix'], $metadata );
+		$mtimes   = self::upload_all( S3Client::from_options(), $files );
+		if ( is_wp_error( $mtimes ) ) {
+			// Objects already uploaded stay; the next attempt overwrites them
+			// under the same keys.
+			return $mtimes;
 		}
 		self::forget_orphans( $location, array_keys( $files ) );
 
 		$record = $location + array(
-			'objects'   => array_keys( $files ),
-			// Files modified after this are re-uploaded by resync.
-			'synced_at' => $sync_started,
+			'objects' => array_keys( $files ),
+			// Modification time of each file as uploaded: resync re-uploads
+			// files whose time differs.
+			'mtimes'  => $mtimes,
 		);
 		$abort = self::abort_before_write( $attachment_id, $location, array_keys( $files ) );
 		if ( $abort ) {
@@ -166,10 +163,12 @@ class Offloader {
 	 * @param array<string,string> $files object key => local path.
 	 */
 	private static function delete_local_after_upload( $attachment_id, array $files ) {
-		if ( ! Options::delete_local_enabled() || self::is_local_delete_deferred( $attachment_id ) ) {
+		if ( ! Options::delete_local_wanted() || self::is_local_delete_deferred( $attachment_id ) ) {
 			return;
 		}
-		if ( self::should_defer_local_delete( $attachment_id ) ) {
+		// Paused (server rule not verified right now): the sweep deletes them
+		// once it is.
+		if ( ! Options::delete_local_enabled() || self::should_defer_local_delete( $attachment_id ) ) {
 			self::defer_local_delete( $attachment_id );
 			return;
 		}
@@ -188,7 +187,10 @@ class Offloader {
 	 */
 	private static function abort_before_write( $attachment_id, array $location, array $keys ) {
 		if ( ! self::post_exists( $attachment_id ) ) {
-			self::queue_orphans( $location, $keys );
+			// Unless an attachment sharing the file uses the same keys.
+			if ( empty( array_filter( self::twins( $attachment_id ), array( __CLASS__, 'is_offloaded' ) ) ) ) {
+				self::queue_orphans( $location, $keys );
+			}
 			return new \WP_Error( 'bmo_deleted', sprintf( 'Attachment %d was deleted while its files were uploading.', $attachment_id ) );
 		}
 		if ( ! AttachmentLock::still_held( $attachment_id ) ) {
@@ -301,7 +303,7 @@ class Offloader {
 		// Kept local: delete_local off, not offloaded, excluded (never
 		// synced, so new local files may exist nowhere else), or taken out
 		// of the bucket.
-		if ( '1' !== (string) Options::get( 'delete_local' ) || ! self::is_offloaded( $attachment_id ) || self::is_excluded( $attachment_id ) || '' !== get_post_meta( $attachment_id, self::KEEP_LOCAL_META, true ) ) {
+		if ( ! Options::delete_local_wanted() || ! self::is_offloaded( $attachment_id ) || self::is_excluded( $attachment_id ) || '' !== get_post_meta( $attachment_id, self::KEEP_LOCAL_META, true ) ) {
 			delete_post_meta( $attachment_id, self::DEFERRED_META );
 			return true;
 		}
@@ -341,6 +343,15 @@ class Offloader {
 	 * @return array{finished:int,waiting:int,errors:string[]}
 	 */
 	public static function sweep_deferred_deletes( $force = false, $time_budget = self::CRON_TIME_BUDGET ) {
+		if ( Options::delete_local_wanted() && ! Options::delete_local_enabled() ) {
+			// Paused: nothing can be deleted; try again later.
+			self::schedule_sweep();
+			return array(
+				'finished' => 0,
+				'waiting'  => self::count_deferred(),
+				'errors'   => array( 'Local deletes are paused until the server rule works.' ),
+			);
+		}
 		$finished    = 0;
 		$waiting     = 0;
 		$errors      = array();
@@ -567,7 +578,7 @@ class Offloader {
 	}
 
 	/**
-	 * @return array{0:array,1:array<string,string>,2:int}|null [record, key => path, sync start], or null with nothing to do
+	 * @return array{0:array,1:array<string,string>}|null [record, key => path], or null with nothing to do
 	 */
 	private static function resync_plan( $attachment_id, $metadata, $unfiltered = false ) {
 		$data = get_post_meta( $attachment_id, self::META_KEY, true );
@@ -579,17 +590,16 @@ class Offloader {
 			return null;
 		}
 
-		$sync_started = time();
-		$have         = array_flip( (array) $data['objects'] );
-		$synced_at    = (int) $data['synced_at'];
-		$new_files    = array();
+		clearstatcache();
+		$have      = array_flip( (array) $data['objects'] );
+		$mtimes    = isset( $data['mtimes'] ) ? (array) $data['mtimes'] : array();
+		$new_files = array();
 		foreach ( self::collect_files( $attachment_id, $file, self::stored_prefix( $data ), $metadata ) as $object_key => $path ) {
-			// >=: a file rewritten within the second the last sync started.
-			if ( ! isset( $have[ $object_key ] ) || filemtime( $path ) >= $synced_at ) {
+			if ( ! isset( $have[ $object_key ] ) || ! isset( $mtimes[ $object_key ] ) || filemtime( $path ) !== (int) $mtimes[ $object_key ] ) {
 				$new_files[ $object_key ] = $path;
 			}
 		}
-		return empty( $new_files ) ? null : array( $data, $new_files, $sync_started );
+		return empty( $new_files ) ? null : array( $data, $new_files );
 	}
 
 	private static function resync_locked( $attachment_id, $metadata ) {
@@ -597,20 +607,17 @@ class Offloader {
 		if ( null === $plan ) {
 			return true;
 		}
-		list( $data, $new_files, $sync_started ) = $plan;
+		list( $data, $new_files ) = $plan;
 
-		$client = self::client_for( $data );
-		foreach ( $new_files as $object_key => $path ) {
-			$put = self::upload_one( $client, $object_key, $path );
-			if ( is_wp_error( $put ) ) {
-				return $put;
-			}
+		$mtimes = self::upload_all( self::client_for( $data ), $new_files );
+		if ( is_wp_error( $mtimes ) ) {
+			return $mtimes;
 		}
 		self::forget_orphans( $data, array_keys( $new_files ) );
 
-		$data['objects']   = array_values( array_unique( array_merge( (array) $data['objects'], array_keys( $new_files ) ) ) );
-		$data['synced_at'] = $sync_started;
-		$abort             = self::abort_before_write( $attachment_id, $data, array_keys( $new_files ) );
+		$data['objects'] = array_values( array_unique( array_merge( (array) $data['objects'], array_keys( $new_files ) ) ) );
+		$data['mtimes']  = array_merge( isset( $data['mtimes'] ) ? (array) $data['mtimes'] : array(), $mtimes );
+		$abort           = self::abort_before_write( $attachment_id, $data, array_keys( $new_files ) );
 		if ( $abort ) {
 			return $abort;
 		}
@@ -657,7 +664,8 @@ class Offloader {
 			get_posts(
 				array(
 					'post_type'      => 'attachment',
-					'post_status'    => 'inherit',
+					// Including media in the trash (MEDIA_TRASH).
+					'post_status'    => array( 'inherit', 'private', 'trash' ),
 					'posts_per_page' => -1,
 					'fields'         => 'ids',
 					// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- occasional CLI bulk operation, not a hot path.
@@ -804,6 +812,26 @@ class Offloader {
 	}
 
 	/**
+	 * Uploads every file, recording each one's modification time as read
+	 * before its upload (a change during the upload then shows as a
+	 * difference and is re-uploaded).
+	 *
+	 * @param array<string,string> $files object key => local path.
+	 * @return array<string,int>|\WP_Error object key => mtime.
+	 */
+	private static function upload_all( $client, array $files ) {
+		$mtimes = array();
+		foreach ( $files as $object_key => $path ) {
+			$mtimes[ $object_key ] = (int) filemtime( $path );
+			$put                   = self::upload_one( $client, $object_key, $path );
+			if ( is_wp_error( $put ) ) {
+				return $put;
+			}
+		}
+		return $mtimes;
+	}
+
+	/**
 	 * Streams one file to the bucket and verifies it arrived.
 	 *
 	 * @return true|\WP_Error
@@ -887,7 +915,9 @@ class Offloader {
 	public static function filter_unique_filename( $filename, $ext, $dir ) {
 		$base_dir = self::uploads_basedir();
 		$dir      = trailingslashit( wp_normalize_path( $dir ) );
-		if ( 0 !== strpos( $dir, $base_dir ) || ! Options::is_configured() ) {
+		// Only needed once something is in the bucket (its local copy may be
+		// gone).
+		if ( 0 !== strpos( $dir, $base_dir ) || ! Options::is_configured() || ! self::has_offloaded() ) {
 			return $filename;
 		}
 
@@ -896,7 +926,8 @@ class Offloader {
 		$extension = '' !== $extension ? '.' . $extension : '';
 		$name      = substr( $filename, 0, strlen( $filename ) - strlen( $extension ) );
 		$stems     = self::attached_stems( $rel_dir, $name );
-		$client    = S3Client::from_options();
+		// Short timeout: an unreachable bucket must not stall the upload.
+		$client    = S3Client::from_options( array( 'timeout' => 5 ) );
 		$prefix    = self::key_prefix() . $rel_dir;
 
 		$candidate = $name;

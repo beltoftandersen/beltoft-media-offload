@@ -9,7 +9,7 @@ Requires WordPress 6.2+ and PHP 8.2+.
 - **Saved content holds local upload URLs.** Front-end pages link offloaded media to the bucket through WordPress's own URL filters (attachment URLs, srcset, images in post content). The admin, editors, page builders, AJAX, REST, cron and WP-CLI keep local URLs, so what editors save doesn't depend on the bucket, and taking files out of the bucket or deactivating the plugin breaks no links. (Page caches and data other plugins build while a page is viewed can still hold bucket URLs; page caches are purged when bucket URLs stop working.)
 - **A web server rule serves files missing locally from the bucket.** A request for an upload that isn't on disk is redirected to the same path in the bucket. That covers every link to every file, wherever it's stored: content, page builders, CSS, emails, other plugins' data, caches. On Apache the rule is written to the uploads directory's `.htaccess` automatically; on nginx you add a short snippet shown on the settings page.
 - **Everything is checked the way a visitor sees it.** A test file is fetched from the bucket's public URL (front-end pages link to the bucket only when that works), and a file missing locally must redirect there while files on disk are still served ("Delete local files" only acts when that works). Internal addresses (like a Docker host name) are refused. Checked on every settings change, daily, and with `wp media-offload check-server`; a failing check leaves the previous rule in place, and a check older than three days pauses local deletes.
-- **One bucket per site.** Endpoint, bucket, path-style and SSL can't change while media is offloaded, since the rule sends every missing file to one place.
+- **One bucket per site.** Endpoint, bucket, region, path-style and SSL can't change while media is offloaded, since the rule sends every missing file to one place. To move to another bucket: `wp media-offload unoffload --all --allow-reoffload`, change the settings, then `wp media-offload run`.
 
 ## Features
 
@@ -55,7 +55,7 @@ location @beltoft_media_offload_1 {
 | `wp media-offload retry-deletes` | Retry failed bucket deletes |
 | `wp media-offload finish-deferred [--force]` | Finish local deletes that are waiting |
 | `wp media-offload restore <id>... \| --all` | Bring files back locally |
-| `wp media-offload unoffload <id>... \| --excluded` | Take files out of the bucket for good |
+| `wp media-offload unoffload <id>... \| --excluded \| --all [--allow-reoffload]` | Take files out of the bucket |
 
 ## Licensing
 
@@ -66,6 +66,7 @@ Everything works without a license. A free key only enables automatic updates th
 - Without a working server rule (nginx config you can't change, a host that blocks the site from requesting its own URLs), "Delete local files" stays off; offloading and bucket URLs on the front end still work. Hosts that block loopback requests but have the rule in place can confirm it with the `beltoft_media_offload_server_rule_verified` filter.
 - Code that reads media straight from disk outside the contexts above won't find deleted files; use `beltoft_media_offload_ensure_local()` there.
 - Buckets can't choose a format by the browser's `Accept` header, so `.webp`/`.avif` siblings are uploaded but offloaded images are served in their original format. To keep serving WebP/AVIF by negotiation, leave local files in place and filter `beltoft_media_offload_bucket_urls` to false.
+- Fonts and other files loaded across origins need CORS on the bucket (MinIO sends it by default; AWS S3, R2 and Spaces need a CORS rule).
 - Files over 500 MB aren't offloaded during upload; use the bulk tool or WP-CLI.
 - The vendored async-aws/s3 and Symfony HTTP Client are not namespace-prefixed.
 - The uploads `.htaccess` rule is kept on deactivation and uninstall, so files whose local copy is gone keep working.
@@ -74,7 +75,7 @@ Everything works without a license. A free key only enables automatic updates th
 
 1. Upload the plugin and activate it.
 2. Settings > Media Offload: enter the endpoint, bucket, credentials and, if the bucket is served through a CDN or custom domain, the public domain. Use Test Connection.
-3. On nginx, add the snippet shown under "Server rule" and reload nginx. Check that the status says "Working".
+3. On nginx, add the snippet shown under "Server rule" and reload nginx. Check that both status lines under "Server rule" say "yes".
 4. Turn on "Enabled" and, if you want, "Delete local files after upload".
 5. Offload existing media under Media > Bulk Offload or with `wp media-offload run`.
 
@@ -90,6 +91,16 @@ Links to media end up everywhere: post content, page builders, CSS, emails, othe
 No. It only enables automatic updates.
 
 ## Changelog
+
+### 2.0.1
+
+- Fixed: the bucket check now verifies the bucket's certificate and refuses an http bucket URL on an https site.
+- Fixed: a server rule added by hand is verified when the uploads .htaccess isn't writable.
+- Fixed: files are no longer uploaded twice on upload.
+- Fixed: files handled while "Delete local files" is paused are deleted once the rule works again; a failed check is repeated after 15 minutes.
+- Fixed: the region can't change while media is offloaded; `unoffload --all --allow-reoffload` for moving to another bucket.
+- Fixed: on multisite, each site's check applies to that site only, and only network admins change the settings.
+- Fixed: srcset for full-size images with non-ASCII file names; cropping a Customizer header image downloads it first; PHP files in uploads are refused on Apache.
 
 ### 2.0.0
 

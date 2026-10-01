@@ -32,6 +32,9 @@ class ServerRule {
 
 	const CHECK_HOOK = 'bmo_server_check';
 
+	/** One-off re-check soon after a failed check. */
+	const RECHECK_HOOK = 'bmo_server_recheck';
+
 	const MARKER = 'Beltoft Media Offload';
 
 	/**
@@ -43,11 +46,16 @@ class ServerRule {
 	/** @var bool Settings changed in this request; re-check at shutdown. */
 	private static $recheck = false;
 
-	/** @var array|null Per-request cache of state() + target_base(). */
-	private static $cache = null;
+	/**
+	 * @var array<int,array> Per site: state(), whether it matches the
+	 *                       current target_base(), and when it was read
+	 *                       (long WP-CLI runs re-read it every minute).
+	 */
+	private static $cache = array();
 
 	public static function init() {
 		add_action( self::CHECK_HOOK, array( __CLASS__, 'check' ) );
+		add_action( self::RECHECK_HOOK, array( __CLASS__, 'check' ) );
 		add_action( 'init', array( __CLASS__, 'schedule_daily_check' ) );
 		add_action( 'update_option_' . self::OPTION, array( __CLASS__, 'forget' ) );
 		add_action( 'delete_option_' . self::OPTION, array( __CLASS__, 'forget' ) );
@@ -62,7 +70,7 @@ class ServerRule {
 	 * all saved.
 	 */
 	public static function schedule_recheck() {
-		self::$cache = null;
+		self::$cache = array();
 		if ( ! self::$recheck ) {
 			self::$recheck = true;
 			add_action( 'shutdown', array( __CLASS__, 'check' ) );
@@ -73,11 +81,13 @@ class ServerRule {
 	 * Drops the per-request cache (the stored result changed).
 	 */
 	public static function forget() {
-		self::$cache = null;
+		self::$cache = array();
 	}
 
 	public static function schedule_daily_check() {
-		if ( Options::is_configured() && ! wp_next_scheduled( self::CHECK_HOOK ) ) {
+		// wp_next_scheduled() reads the autoloaded cron option; the secret
+		// key is only loaded when an event is missing.
+		if ( ! wp_next_scheduled( self::CHECK_HOOK ) && Options::is_configured() ) {
 			wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::CHECK_HOOK );
 		}
 	}
@@ -126,14 +136,21 @@ class ServerRule {
 	}
 
 	private static function cached() {
-		if ( null === self::$cache ) {
-			$state       = self::state();
-			self::$cache = array(
+		$blog = get_current_blog_id();
+		if ( ! isset( self::$cache[ $blog ] ) || time() - self::$cache[ $blog ]['read'] > MINUTE_IN_SECONDS ) {
+			if ( isset( self::$cache[ $blog ] ) ) {
+				// Another process may have stored a newer result.
+				wp_cache_delete( self::OPTION, 'options' );
+				wp_cache_delete( 'alloptions', 'options' );
+			}
+			$state                = self::state();
+			self::$cache[ $blog ] = array(
 				'state'   => $state,
 				'current' => '' !== $state['base'] && self::target_base() === $state['base'],
+				'read'    => time(),
 			);
 		}
-		return self::$cache;
+		return self::$cache[ $blog ];
 	}
 
 	/**
@@ -187,7 +204,8 @@ class ServerRule {
 			return self::save( $state, $previous );
 		}
 
-		$state['bucket_ok'] = self::serves( $base . $name, $token, 3 );
+		// The bucket as a browser fetches it: certificate verified.
+		$state['bucket_ok'] = self::serves( $base . $name, $token, 3, true );
 		if ( ! $state['bucket_ok'] ) {
 			/* translators: %s: URL */
 			$state['message'] = sprintf( __( 'The bucket does not serve files publicly at %s. Check the public domain and that the bucket allows public reads.', 'beltoft-media-offload' ), $base );
@@ -209,20 +227,25 @@ class ServerRule {
 		$uploads  = wp_get_upload_dir();
 		$htaccess = trailingslashit( $uploads['basedir'] ) . '.htaccess';
 		$before   = self::read_block( $htaccess );
-		$manage   = '1' === (string) Options::get( 'delete_local' ) || ! empty( $before );
-		if ( $manage && ! self::write_block( $htaccess, self::apache_rules() ) ) {
-			/* translators: %s: file path */
-			$state['message'] = sprintf( __( 'Could not write %s; add the rule by hand.', 'beltoft-media-offload' ), $htaccess );
-			return $state;
-		}
+		$manage   = Options::delete_local_wanted() || ! empty( $before );
+		// Not writable (hardened host, rule in the server config): test
+		// whatever rule is in place.
+		$written = $manage && self::write_block( $htaccess, self::apache_rules() );
 
 		$local_name = 'beltoft-media-offload-local-' . wp_generate_password( 12, false ) . '.txt';
 		$local_file = trailingslashit( $uploads['basedir'] ) . $local_name;
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- a tiny probe file in uploads, removed right after.
-		file_put_contents( $local_file, $token );
+		if ( false === file_put_contents( $local_file, $token ) ) {
+			if ( $written ) {
+				self::write_block( $htaccess, $before );
+			}
+			/* translators: %s: directory path */
+			$state['message'] = sprintf( __( 'The uploads directory %s is not writable.', 'beltoft-media-offload' ), $uploads['basedir'] );
+			return $state;
+		}
 
 		$base     = trailingslashit( $uploads['baseurl'] );
-		$response = self::request( $base . $name, 0 );
+		$response = self::request( $base . $name, 0, false );
 		$code     = is_wp_error( $response ) ? 0 : (int) wp_remote_retrieve_response_code( $response );
 		$location = is_wp_error( $response ) ? '' : (string) wp_remote_retrieve_header( $response, 'location' );
 		$expected = $state['base'] . $name;
@@ -236,15 +259,19 @@ class ServerRule {
 				? sprintf( __( 'Files missing locally redirect to %1$s instead of %2$s.', 'beltoft-media-offload' ), $location, $expected )
 				/* translators: %d: HTTP status code */
 				: sprintf( __( 'A file missing locally answered HTTP %d instead of redirecting to the bucket. Add the server rule.', 'beltoft-media-offload' ), $code );
-		} elseif ( ! self::serves( $base . $local_name, $token, 0 ) ) {
+		} elseif ( ! self::serves( $base . $local_name, $token, 0, false ) ) {
 			$state['message'] = __( 'With the rule in place, files that exist locally are no longer served. The server does not allow this rule here.', 'beltoft-media-offload' );
 		} else {
 			$state['ok'] = true;
 		}
 		wp_delete_file( $local_file );
 
-		if ( ! $state['ok'] && $manage ) {
+		if ( ! $state['ok'] && $written ) {
 			self::write_block( $htaccess, $before );
+		}
+		if ( ! $state['ok'] && $manage && ! $written ) {
+			/* translators: %s: file path */
+			$state['message'] .= ' ' . sprintf( __( '(%s is not writable; add the rule by hand.)', 'beltoft-media-offload' ), $htaccess );
 		}
 		return $state;
 	}
@@ -276,33 +303,47 @@ class ServerRule {
 			/* translators: %s: host name */
 			return sprintf( __( 'Visitors cannot reach %s: it is an internal address. Set a public domain for the bucket.', 'beltoft-media-offload' ), $host );
 		}
+		// Browsers block http images on https pages (mixed content).
+		if ( 0 === strpos( $base, 'http://' ) && 0 === strpos( home_url(), 'https://' ) ) {
+			return __( 'The bucket URL uses http on an https site; browsers would block it. Use an https public domain or enable SSL.', 'beltoft-media-offload' );
+		}
 		return null;
 	}
 
 	/**
 	 * Whether $url answers 200 with exactly $body, following $redirects.
 	 */
-	private static function serves( $url, $body, $redirects ) {
-		$response = self::request( $url, $redirects );
+	private static function serves( $url, $body, $redirects, $verify_ssl ) {
+		$response = self::request( $url, $redirects, $verify_ssl );
 		return ! is_wp_error( $response ) && 200 === (int) wp_remote_retrieve_response_code( $response ) && wp_remote_retrieve_body( $response ) === $body;
 	}
 
-	private static function request( $url, $redirects ) {
+	/**
+	 * @param bool $verify_ssl True for the bucket; loopback requests to the
+	 *                         site itself follow core's own rule (site
+	 *                         health, cron).
+	 */
+	private static function request( $url, $redirects, $verify_ssl ) {
 		return wp_remote_get(
 			$url,
 			array(
 				'redirection' => $redirects,
 				'timeout'     => 15,
 				'headers'     => array( 'Cache-Control' => 'no-cache' ),
-				// Same as core's own loopback requests (site health, cron).
-				'sslverify'   => apply_filters( 'https_local_ssl_verify', false ), // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- core's own filter for loopback requests.
+				'sslverify'   => $verify_ssl ? true : apply_filters( 'https_local_ssl_verify', false ), // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- core's own filter for loopback requests.
 			)
 		);
 	}
 
 	private static function save( array $state, array $previous ) {
-		update_option( self::OPTION, $state, false );
-		self::$cache = null;
+		// Autoloaded: read on every front-end page.
+		update_option( self::OPTION, $state, true );
+		self::$cache = array();
+		// A failure pauses local deletes and bucket URLs: look again soon
+		// rather than at the next daily check.
+		if ( ! $state['ok'] && Options::is_configured() && ! wp_next_scheduled( self::RECHECK_HOOK ) ) {
+			wp_schedule_single_event( time() + 15 * MINUTE_IN_SECONDS, self::RECHECK_HOOK );
+		}
 		// Cached pages link to the old bucket URL (or to it at all).
 		if ( '' !== $previous['base'] && ( $previous['base'] !== $state['base'] || ! empty( $previous['bucket_ok'] ) !== ! empty( $state['bucket_ok'] ) ) ) {
 			Cache::purge();
@@ -321,10 +362,11 @@ class ServerRule {
 	/**
 	 * The .htaccess block for this site's uploads directory. The pattern is
 	 * relative to that directory, so it works in subdirectory installs and
-	 * multisite subsites (each has its own uploads directory). Inherit
-	 * keeps rewrite rules of parent directories (image converters, hotlink
-	 * protection) working for uploads; they run after this one, which only
-	 * acts on missing files.
+	 * multisite subsites (each has its own uploads directory). Inherit lets
+	 * rewrite rules of parent directories run for uploads too (after this
+	 * one, which only acts on missing files), though rules anchored at the
+	 * full uploads path no longer match; PHP in uploads is refused here
+	 * as security plugins do.
 	 *
 	 * @return string[] Lines.
 	 */
@@ -335,6 +377,7 @@ class ServerRule {
 			'<IfModule mod_rewrite.c>',
 			'RewriteEngine On',
 			'RewriteOptions Inherit',
+			'RewriteRule \.(?:php\d?|phtml|phar)$ - [F,L]',
 			'RewriteCond %{REQUEST_FILENAME} !-f',
 			'RewriteCond %{REQUEST_FILENAME} !-d',
 			'RewriteRule ^(.+)$ ' . $base . '$1 [R=302,L]',
