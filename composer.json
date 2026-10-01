@@ -1,0 +1,15 @@
+{
+	"name": "beltoft/media-offload",
+	"description": "Vendored dependencies for beltoft-media-offload (async-aws/s3 client).",
+	"license": "GPL-2.0-or-later",
+	"require": {
+		"php": ">=8.2",
+		"async-aws/s3": "^2.0"
+	},
+	"config": {
+		"platform": {
+			"php": "8.2.28"
+		},
+		"sort-packages": true
+	}
+}
